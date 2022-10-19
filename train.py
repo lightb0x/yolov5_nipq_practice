@@ -56,6 +56,8 @@ from utils.plots import plot_evolve, plot_labels
 from utils.torch_utils import (EarlyStopping, ModelEMA, de_parallel, select_device, smart_DDP, smart_optimizer,
                                smart_resume, torch_distributed_zero_first)
 
+from models.qmodules import bops_loss, initialize_Q, print_bitwidth
+
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
@@ -87,7 +89,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     # Loggers
     data_dict = None
     if RANK in {-1, 0}:
-        loggers = Loggers(save_dir, weights, opt, hyp, LOGGER)  # loggers instance
+        loggers = Loggers(save_dir, weights, opt, hyp, LOGGER, apply_nipq=opt.apply_nipq)  # loggers instance
         if loggers.clearml:
             data_dict = loggers.clearml.data_dict  # None if no ClearML dataset or filled in by ClearML
         if loggers.wandb:
@@ -150,7 +152,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     nbs = 64  # nominal batch size
     accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
     hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
-    optimizer = smart_optimizer(model, opt.optimizer, hyp['lr0'], hyp['momentum'], hyp['weight_decay'])
+    optimizer = smart_optimizer(model, opt.optimizer, hyp['lr0'], hyp['momentum'], hyp['weight_decay'], opt.apply_nipq)
 
     # Scheduler
     if opt.cos_lr:
@@ -241,6 +243,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc  # attach class weights
     model.names = names
 
+    # initialize NIPQ modules
+    initialize_Q(model, mode='first',
+                 sample_input=torch.randn(
+                    [batch_size, 3, imgsz, imgsz], device=device),
+                 channel_last=False)
+    target_bops = torch.tensor(opt.target_bops, device=device)
+
     # Start training
     t0 = time.time()
     nb = len(train_loader)  # number of batches
@@ -259,6 +268,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+        if opt.apply_nipq and epoch == opt.train_epochs:
+            initialize_Q(model, mode='finetune')
         callbacks.run('on_train_epoch_start')
         model.train()
 
@@ -272,11 +283,15 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
-        mloss = torch.zeros(3, device=device)  # mean losses
+        # mean losses
+        mloss = torch.zeros(4 if opt.apply_nipq else 3, device=device)
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
-        LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'labels', 'img_size'))
+        if opt.apply_nipq:
+            LOGGER.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'bop', 'labels', 'img_size'))
+        else:
+            LOGGER.info(('\n' + '%10s' * 7) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'labels', 'img_size'))
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
         optimizer.zero_grad()
@@ -307,11 +322,18 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             # Forward
             with torch.cuda.amp.autocast(amp):
                 pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
-                if RANK != -1:
-                    loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
-                if opt.quad:
-                    loss *= 4.
+            loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+            # NIPQ BitOPs loss
+            lbops = 0
+            if opt.apply_nipq:
+                lbops = bops_loss(model, target_bops, opt.lambda_bops)
+                loss_items = torch.cat((loss_items, lbops.view([-1]))).detach()
+            loss = loss + lbops
+
+            if RANK != -1:
+                loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+            if opt.quad:
+                loss *= 4.
 
             # Backward
             scaler.scale(loss).backward()
@@ -331,7 +353,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)  # update mean losses
                 mem = f'{torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0:.3g}G'  # (GB)
-                pbar.set_description(('%10s' * 2 + '%10.4g' * 5) %
+                num_str = 6 if opt.apply_nipq else 5
+                pbar.set_description(('%10s' * 2 + '%10.4g' * num_str) %
                                      (f'{epoch}/{epochs - 1}', mem, *mloss, targets.shape[0], imgs.shape[-1]))
                 callbacks.run('on_train_batch_end', ni, model, imgs, targets, paths, plots)
                 if callbacks.stop_training:
@@ -390,6 +413,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 del ckpt
                 callbacks.run('on_model_save', last, epoch, final_epoch, best_fitness, fi)
 
+        # NIPQ print bitwidth
+        if opt.apply_nipq:
+            print_bitwidth(model)
         # EarlyStopping
         if RANK != -1:  # if DDP training
             broadcast_list = [stop if RANK == 0 else None]
@@ -474,7 +500,24 @@ def parse_opt(known=False):
     parser.add_argument('--bbox_interval', type=int, default=-1, help='W&B: Set bounding-box image logging interval')
     parser.add_argument('--artifact_alias', type=str, default='latest', help='W&B: Version of dataset artifact to use')
 
-    return parser.parse_known_args()[0] if known else parser.parse_args()
+    # NIPQ hyperparameters
+    parser.add_argument('--apply_nipq', action='store_true')
+    parser.add_argument('--target_bops', type=float, default=150.0,
+                        help='NIPQ BitOPs target')
+    parser.add_argument('--lambda_bops', type=float, default=1e-2,
+                        help='NIPQ BitOPs lambda')
+    parser.add_argument('--freeze_finetune_epochs', type=int, default=5,
+                        help='number of epochs to train LSQ with fixed bits')
+
+    opt =  parser.parse_known_args()[0] if known else parser.parse_args()
+
+    if opt.apply_nipq and not '_q' in opt.cfg:
+        print('applying NIPQ on vanilla model')
+        exit()
+
+    opt.train_epochs = opt.epochs
+    opt.epochs = opt.train_epochs + opt.freeze_finetune_epochs
+    return opt
 
 
 def main(opt, callbacks=Callbacks()):

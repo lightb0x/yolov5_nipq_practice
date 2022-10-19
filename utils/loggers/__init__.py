@@ -44,7 +44,7 @@ except (ImportError, AssertionError):
 
 class Loggers():
     # YOLOv5 Loggers class
-    def __init__(self, save_dir=None, weights=None, opt=None, hyp=None, logger=None, include=LOGGERS):
+    def __init__(self, save_dir=None, weights=None, opt=None, hyp=None, logger=None, include=LOGGERS, apply_nipq=False):
         self.save_dir = save_dir
         self.weights = weights
         self.opt = opt
@@ -65,6 +65,9 @@ class Loggers():
             'x/lr0',
             'x/lr1',
             'x/lr2']  # params
+        if apply_nipq:
+            self.keys.insert(3, 'train/bop_loss')
+            self.keys.append('x/lr3')
         self.best_keys = ['best/epoch', 'best/precision', 'best/recall', 'best/mAP_0.5', 'best/mAP_0.5:0.95']
         for k in LOGGERS:
             setattr(self, k, None)  # init empty logger dictionary

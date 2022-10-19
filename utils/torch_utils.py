@@ -314,9 +314,14 @@ def copy_attr(a, b, include=(), exclude=()):
             setattr(a, k, v)
 
 
-def smart_optimizer(model, name='Adam', lr=0.001, momentum=0.9, decay=1e-5):
+def smart_optimizer(model, name='Adam', lr=0.001, momentum=0.9, decay=1e-5,
+                    apply_nipq=False):
+    from models.qmodules import Quantizer
     # YOLOv5 3-param group optimizer: 0) weights with decay, 1) weights no decay, 2) biases no decay
-    g = [], [], []  # optimizer parameter groups
+    if apply_nipq:
+        g = [], [], [], []  # optimizer parameter groups
+    else:
+        g = [], [], []  # optimizer parameter groups
     bn = tuple(v for k, v in nn.__dict__.items() if 'Norm' in k)  # normalization layers, i.e. BatchNorm2d()
     for v in model.modules():
         if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):  # bias (no decay)
@@ -325,6 +330,9 @@ def smart_optimizer(model, name='Adam', lr=0.001, momentum=0.9, decay=1e-5):
             g[1].append(v.weight)
         elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):  # weight (with decay)
             g[0].append(v.weight)
+        if apply_nipq and isinstance(v, Quantizer):
+            g[3].append(v._bitwidth)
+            g[3].append(v._alpha)
 
     if name == 'Adam':
         optimizer = torch.optim.Adam(g[2], lr=lr, betas=(momentum, 0.999))  # adjust beta1 to momentum
@@ -339,8 +347,13 @@ def smart_optimizer(model, name='Adam', lr=0.001, momentum=0.9, decay=1e-5):
 
     optimizer.add_param_group({'params': g[0], 'weight_decay': decay})  # add g0 with weight_decay
     optimizer.add_param_group({'params': g[1], 'weight_decay': 0.0})  # add g1 (BatchNorm2d weights)
+    if apply_nipq:
+        optimizer.add_param_group({
+            'params': g[3],
+            'weight_decay': 0.0,
+            'momentum': 0.0})  # NIPQ parameters: no momentum, no decay
     LOGGER.info(f"{colorstr('optimizer:')} {type(optimizer).__name__}(lr={lr}) with parameter groups "
-                f"{len(g[1])} weight(decay=0.0), {len(g[0])} weight(decay={decay}), {len(g[2])} bias")
+                f"{len(g[1])} weight(decay=0.0), {len(g[0])} weight(decay={decay}), {len(g[2])} bias" + f", {len(g[3])} NIPQ parameters" if apply_nipq else "")
     return optimizer
 
 

@@ -72,11 +72,11 @@ class Q_Linear(nn.Linear):
 
 class noise_quant(Function):
     @staticmethod
-    def forward(ctx, x, n_lv_inv):
+    def forward(ctx, x, step):
         # TODO randomly sample random seed
         ctx.save_for_backward(rseed)
 
-        # TODO x + round(N(0, 1) / 2) * n_lv_inv
+        # TODO x + round(N(0, 1) / 2) * step
         # TODO try to reduce memory usage
 
         return t1
@@ -85,9 +85,9 @@ class noise_quant(Function):
     def backward(ctx, grad_output):
         rseed = ctx.saved_tensors[0]
         # TODO construct same random values as forward
-        # TODO get grad_n_lv_inv
+        # TODO get grad_step
 
-        return grad_output, grad_n_lv_inv
+        return grad_output, grad_step
 
 
 noise_quant = noise_quant.apply
@@ -170,15 +170,18 @@ class Quantizer(nn.Module):
             alpha = alpha.cpu()
             offset = offset.cpu()
 
-        n_lv_inv = torch.reciprocal(torch.pow(2., bitwidth) - 1)
+        n_lv = torch.pow(2., bitwidth) - 1
+        n_lv_inv = torch.reciprocal(n_lv)
 
+        step = alpha * n_lv_inv
+        x = x + offset
         if is_training and self._bitwidth.requires_grad:
             # TODO NIPQ
             pass
         else:
             # TODO LSQ
             pass
-        return torch.clamp(x, 0, 1) * alpha - offset
+        return x - offset
 
     def forward(self, x):
         return self._quant(x, self.training)
@@ -238,14 +241,14 @@ def model_bops(model):
 
 def bops_loss(model, target_bops, lambda_bops):
     total_bops = model_bops(model)
-    return F.mse_loss(total_bops, target_bops) * lambda_bops
-    # return F.smooth_l1_loss(total_bops, target_bops) * lambda_bops
+    return F.smooth_l1_loss(total_bops, target_bops) * lambda_bops
 
 
 def sample_activation_size(model, x, channel_last=False):
     # forward hook for bops calculation (output h & w)
     # `out_height`, `out_width` for Conv2d
     hooks = []
+    off_hooks = []
 
     def forward_hook(module, inputs, outputs):
         # pytorch default [batch, channel, height, width]
@@ -258,15 +261,79 @@ def sample_activation_size(model, x, channel_last=False):
         module.out_height = outputs.shape[offset]
         module.out_width = outputs.shape[offset + 1]
 
+    def optimal_i(target, unit):
+        min_err = 100
+        min_err_i = -1
+        for i in range(0, 5):
+            err = abs(target - unit * i)
+            if min_err > err:
+                min_err = err
+                min_err_i = i
+        if min_err_i == -1:
+            print('could not find optimal `i`')
+            print(f'target={target}, unit={unit}')
+            exit()
+        return min_err_i
+
+    def group_err(arr, offset, g=1):
+        arr_len = len(arr)
+        arr_err = torch.zeros_like(arr)
+        arr_off = torch.zeros_like(arr)
+        elem_per_group = arr_len // g
+        for i in range(g):
+            i0 = i * elem_per_group
+            i1 = (i + 1) * elem_per_group
+            if i == g - 1:
+                off_unit = arr[i0:].min().item()
+                off_unit = offset * optimal_i(off_unit, offset)
+                arr_err[i0:] = abs(arr[i0:] - off_unit)
+                arr_off[i0:] = arr[i0:] - arr[i0:] + off_unit
+            else:
+                off_unit = arr[i0:i1].min().item()
+                off_unit = offset * optimal_i(off_unit, offset)
+                arr_err[i0:i1] = abs(arr[i0:i1] - off_unit)
+                arr_off[i0:i1] = arr[i0:i1] - arr[i0:i1] + off_unit
+
+        return arr_err.mean().item(), arr_off
+
+    def forward_off_hook(module, inputs, outputs):
+        if hasattr(module, 'a_quant') and not module.a_quant.symm:
+            c_idx = 3 if channel_last else 1
+            permute_idx = [3, 0, 1, 2] if channel_last else [1, 0, 2, 3]
+            num_channels = inputs[0].shape[c_idx]
+
+            if num_channels == 3:
+                return
+
+            # get optimal number of groups `g`
+            off = module.a_quant.offset
+            min_err = 100
+            min_err_g = 0
+            c_min = inputs[0].permute(permute_idx).reshape(
+                [num_channels, -1]).min(dim=1).values
+            for g in range(1, 5):
+                err, _ = group_err(c_min, -off, g)
+                if min_err > err:
+                    min_err = err
+                    min_err_g = g
+
+            # given number of groups `g`, get `module.offset`
+            _, arr_off = group_err(c_min, -off, min_err_g)
+
+            module.a_quant.offset = -arr_off.view([-1, 1, 1])
     for _, module in model.named_modules():
         if isinstance(module, nn.Conv2d):
             hooks.append(module.register_forward_hook(forward_hook))
+        if isinstance(module, Q_Conv2d):
+            off_hooks.append(module.register_forward_hook(forward_off_hook))
 
     with torch.no_grad():
         model.eval()
         model(x)
 
     for hook in hooks:
+        hook.remove()
+    for hook in off_hooks:
         hook.remove()
 
     return

@@ -245,7 +245,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
     # initialize NIPQ modules
     initialize_Q(model, mode='first',
-                 sample_input=torch.randn(
+                 sample_input=torch.rand(
                     [batch_size, 3, imgsz, imgsz], device=device),
                  channel_last=False)
     target_bops = torch.tensor(opt.target_bops, device=device)
